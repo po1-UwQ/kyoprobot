@@ -1,0 +1,209 @@
+import discord
+from discord.ext import commands, tasks
+import aiohttp
+import asyncio
+import json
+import os
+from datetime import datetime, timedelta
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from collections import defaultdict
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.guilds = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# --- 永続化ファイル ---
+USER_DATA_FILE = "tracked_users.json"
+CHANNEL_DATA_FILE = "ac_channels.json"
+
+CACHE = {
+    "problem_difficulty": {},
+    "user_submissions": {},
+    "user_profiles": {},
+    "last_ac_check": defaultdict(lambda: defaultdict(set)),
+    "last_contests": []
+}
+
+# サーバーごとのユーザー管理
+TRACKED_USERS_PER_GUILD = defaultdict(set)
+# サーバーごとのAC報告チャンネル設定
+AC_REPORT_CHANNEL = {}
+
+# -----------------------------
+# 永続化用ローディング・保存
+# -----------------------------
+def load_persistent_data():
+    if os.path.exists(USER_DATA_FILE):
+        with open(USER_DATA_FILE, "r") as f:
+            data = json.load(f)
+            for gid, users in data.items():
+                TRACKED_USERS_PER_GUILD[int(gid)] = set(users)
+
+    if os.path.exists(CHANNEL_DATA_FILE):
+        with open(CHANNEL_DATA_FILE, "r") as f:
+            data = json.load(f)
+            for gid, cid in data.items():
+                AC_REPORT_CHANNEL[int(gid)] = int(cid)
+
+def save_persistent_data():
+    with open(USER_DATA_FILE, "w") as f:
+        json.dump({gid: list(users) for gid, users in TRACKED_USERS_PER_GUILD.items()}, f)
+
+    with open(CHANNEL_DATA_FILE, "w") as f:
+        json.dump(AC_REPORT_CHANNEL, f)
+
+# -----------------------------
+async def fetch_json(url):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as resp:
+            return await resp.json()
+
+async def get_problem_difficulties():
+    if not CACHE["problem_difficulty"]:
+        CACHE["problem_difficulty"] = await fetch_json("https://kenkoooo.com/atcoder/resources/problem-models.json")
+    return CACHE["problem_difficulty"]
+
+async def get_user_submissions(username):
+    now = datetime.utcnow()
+    if username in CACHE["user_submissions"]:
+        time_diff = now - CACHE["user_submissions"][username]["fetched_at"]
+        if time_diff < timedelta(minutes=5):
+            return CACHE["user_submissions"][username]["data"]
+
+    data = await fetch_json(f"https://kenkoooo.com/atcoder/atcoder-api/v3/user/submissions?user={username}&from_second=0")
+    CACHE["user_submissions"][username] = {"data": data, "fetched_at": now}
+    return data
+
+async def get_user_profiles():
+    if not CACHE["user_profiles"]:
+        CACHE["user_profiles"] = await fetch_json("https://kenkoooo.com/atcoder/resources/merged-profiles.json")
+    return CACHE["user_profiles"]
+
+def calculate_score(submissions, problem_difficulty_map, rate):
+    solved = set()
+    score = 0
+    for sub in submissions:
+        pid = sub['problem_id']
+        if sub['result'] == 'AC' and pid not in solved:
+            solved.add(pid)
+            diff = problem_difficulty_map.get(pid, {}).get('difficulty')
+            if diff:
+                score += diff * (1 + rate / 4000)
+    return int(score)
+
+@bot.command()
+async def add(ctx, username):
+    TRACKED_USERS_PER_GUILD[ctx.guild.id].add(username)
+    save_persistent_data()
+    await ctx.send(f"✅ ユーザー `{username}` をランキングに追加しました。")
+
+@bot.command()
+async def remove(ctx, username):
+    TRACKED_USERS_PER_GUILD[ctx.guild.id].discard(username)
+    save_persistent_data()
+    await ctx.send(f"❌ ユーザー `{username}` をランキングから削除しました。")
+
+@bot.command()
+async def list_users(ctx):
+    users = TRACKED_USERS_PER_GUILD[ctx.guild.id]
+    if not users:
+        await ctx.send("ランキング対象ユーザーはいません。`!add <ユーザー名>`で追加してください。")
+    else:
+        await ctx.send("📋 トラッキング中のユーザー:\n" + "\n".join(users))
+
+@bot.command()
+async def rank(ctx):
+    await send_ranking(ctx.guild.id, ctx.channel)
+
+@bot.command()
+async def set_ac_channel(ctx):
+    AC_REPORT_CHANNEL[ctx.guild.id] = ctx.channel.id
+    save_persistent_data()
+    await ctx.send(f"📣 このチャンネルをAC通知チャンネルに設定しました。")
+
+async def send_ranking(guild_id, channel):
+    problem_difficulty_map = await get_problem_difficulties()
+    user_profiles = await get_user_profiles()
+    results = []
+
+    for username in TRACKED_USERS_PER_GUILD[guild_id]:
+        submissions = await get_user_submissions(username)
+        profile = user_profiles.get(username, {})
+        rate = profile.get("rate", 0)
+        score = calculate_score(submissions, problem_difficulty_map, rate)
+        results.append((username, score, rate))
+
+    results.sort(key=lambda x: x[1], reverse=True)
+
+    if not results:
+        await channel.send("ランキング対象のユーザーがいません。")
+        return
+
+    response = "**🏆 AtCoder ランキング 🏆**\n"
+    for i, (username, score, rate) in enumerate(results, 1):
+        response += f"{i}. `{username}`: {score}点 (Rate: {rate})\n"
+
+    await channel.send(response)
+
+# --- コンテスト通知 ---
+@tasks.loop(minutes=10)
+async def contest_announcer():
+    data = await fetch_json("https://kenkoooo.com/atcoder/resources/contest/upcoming.json")
+    now = datetime.utcnow().timestamp()
+    new_contests = [c for c in data if c['start_epoch_second'] > now]
+    new_ids = set(c['id'] for c in new_contests)
+
+    if new_ids != set(CACHE['last_contests']):
+        CACHE['last_contests'] = list(new_ids)
+        for guild in bot.guilds:
+            ch_id = AC_REPORT_CHANNEL.get(guild.id)
+            if ch_id:
+                channel = bot.get_channel(ch_id)
+                if channel:
+                    msg = "📢 新しいAtCoderコンテストが公開されました！\n"
+                    for c in sorted(new_contests, key=lambda x: x['start_epoch_second']):
+                        dt = datetime.fromtimestamp(c['start_epoch_second'])
+                        msg += f"[{c['title']}](https://atcoder.jp/contests/{c['id']}) - {dt.strftime('%Y/%m/%d %H:%M')} JST\n"
+                    await channel.send(msg)
+
+# --- 毎週ランキング投稿 ---
+scheduler = AsyncIOScheduler()
+@scheduler.scheduled_job("cron", day_of_week="mon", hour=12, minute=0)
+async def scheduled_post():
+    for guild in bot.guilds:
+        if guild.id in TRACKED_USERS_PER_GUILD:
+            channel = discord.utils.get(guild.text_channels, name="atcoder-ranking")
+            if channel:
+                await send_ranking(guild.id, channel)
+
+# --- ACチェック ---
+@tasks.loop(minutes=5)
+async def check_ac_reports():
+    problem_difficulty_map = await get_problem_difficulties()
+    for guild_id, usernames in TRACKED_USERS_PER_GUILD.items():
+        for username in usernames:
+            submissions = await get_user_submissions(username)
+            new_ac = []
+            for sub in submissions:
+                if sub['result'] == 'AC':
+                    pid = sub['problem_id']
+                    if pid not in CACHE["last_ac_check"][guild_id][username]:
+                        CACHE["last_ac_check"][guild_id][username].add(pid)
+                        new_ac.append((pid, sub['contest_id']))
+            if new_ac and guild_id in AC_REPORT_CHANNEL:
+                channel = bot.get_channel(AC_REPORT_CHANNEL[guild_id])
+                msg = f"🎉 `{username}` が新しく {len(new_ac)} 問 ACしました！\n"
+                for pid, cid in new_ac:
+                    msg += f"- {cid}/{pid}\n"
+                await channel.send(msg)
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+    load_persistent_data()
+    scheduler.start()
+    check_ac_reports.start()
+    contest_announcer.start()
+
+bot.run(os.getenv("DISCORD_BOT_TOKEN"))
